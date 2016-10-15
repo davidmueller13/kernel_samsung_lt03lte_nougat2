@@ -862,15 +862,6 @@ int subsystem_restart_dev(struct subsys_device *dev)
 		 * We should guarantee time the App needs for saving logs
 		 * as well, so we use a delayed workqueue.
 		 */
-		if(silent_log_panic_handler())
-		{
-			pr_err("%s crashed: subsys-restart: Resetting the SoC\n",
-				name);
-			strncpy(subsys_name, name, sizeof(subsys_name)-1);
-			subsys_name[sizeof(subsys_name)-1] = '\0';
-			queue_delayed_work(panic_wq, &panic_dwork, 300);
-			dump_stack();
-		} else
 			panic("%s crashed: subsys-restart: Resetting the SoC",
 				name);
 #else
