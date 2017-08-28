@@ -20,6 +20,7 @@
 #include <asm/cacheflush.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
+#include <linux/freezer.h>
 #include <linux/fs.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
@@ -703,7 +704,7 @@ static int binder_update_page_range(struct binder_proc *proc, int allocate,
 		page = &proc->pages[(page_addr - proc->buffer) / PAGE_SIZE];
 
 		BUG_ON(*page);
-		*page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		*page = alloc_page(GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
 		if (*page == NULL) {
 			pr_err("%d: binder_alloc_buf failed for page at %pK\n",
 				proc->pid, page_addr);
@@ -2135,9 +2136,10 @@ static void binder_transaction(struct binder_proc *proc,
 		size_t object_size = binder_validate_object(t->buffer, *offp);
 
 		if (object_size == 0 || *offp < off_min) {
-			binder_user_error("%d:%d got transaction with invalid offset, %lld\n"
-				proc->pid, thread->pid, (u64)*offp, (u64)off_min,
-				(u64)t->buffer->data_size);
+			binder_user_error("%d:%d got transaction with invalid offset (%lld, min %lld max %lld) or object.\n",
+					  proc->pid, thread->pid, (u64)*offp,
+					  (u64)off_min,
+					  (u64)t->buffer->data_size);
 			return_error = BR_FAILED_REPLY;
 			goto err_bad_offset;
 		}
@@ -2750,6 +2752,7 @@ retry:
 			if (put_user(thread->return_error2, (uint32_t __user *)ptr))
 				return -EFAULT;
 			ptr += sizeof(uint32_t);
+			binder_stat_br(proc, thread, thread->return_error2);
 			if (ptr == end)
 				goto done;
 			thread->return_error2 = BR_OK;
@@ -2757,6 +2760,7 @@ retry:
 		if (put_user(thread->return_error, (uint32_t __user *)ptr))
 			return -EFAULT;
 		ptr += sizeof(uint32_t);
+		binder_stat_br(proc, thread, thread->return_error);
 		thread->return_error = BR_OK;
 		goto done;
 	}
@@ -2922,6 +2926,7 @@ retry:
 				     (binder_uintptr_t __user *)ptr))
 				return -EFAULT;
 			ptr += sizeof(binder_uintptr_t);
+			binder_stat_br(proc, thread, cmd);
 			binder_debug(BINDER_DEBUG_DEATH_NOTIFICATION,
 				     "%d:%d %s %016llx\n",
 				      proc->pid, thread->pid,
@@ -3030,6 +3035,7 @@ done:
 			     proc->pid, thread->pid);
 		if (put_user(BR_SPAWN_LOOPER, (uint32_t __user *)buffer))
 			return -EFAULT;
+		binder_stat_br(proc, thread, BR_SPAWN_LOOPER);
 	}
 	return 0;
 }
@@ -3315,30 +3321,6 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			goto err;
 		}
 		break;
-
-	/* { System SW, SA_SAMP */
-	// SAMP : Service Process Management
-	case BINDER_GET_PROC_BINDERSTATS: {
-		//get proc stats,(bc_transactions/br_transactions)
-		//used for the binded service
-		int transactions;
-		if (size != sizeof(int)) {
-			ret = -EINVAL;
-			goto err;
-		}
-
-		//Only consider the called times now
-		transactions = proc->stats.br[_IOC_NR(BR_TRANSACTION)] /*+ proc->stats.bc[_IOC_NR(BC_TRANSACTION)] */;
-
-		binder_debug(BINDER_DEBUG_READ_WRITE,
-			"-- BINDER_GET_PROC_BINDERSTATS transactions = %d\n", transactions);
-		if (put_user(transactions, (uint32_t __user *)ubuf)) {
-			ret = -EINVAL;
-			goto err;
-		}
-		break;
-		}
-	/* System SW, SA_SAMP } */
 	default:
 		ret = -EINVAL;
 		goto err;
@@ -3379,15 +3361,9 @@ static void binder_vma_close(struct vm_area_struct *vma)
 	binder_defer_work(proc, BINDER_DEFERRED_PUT_FILES);
 }
 
-static int binder_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
-{
-	return VM_FAULT_SIGBUS;
-}
-
 static struct vm_operations_struct binder_vm_ops = {
 	.open = binder_vma_open,
 	.close = binder_vma_close,
-	.fault = binder_vm_fault,
 };
 
 static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -3404,19 +3380,6 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	if ((vma->vm_end - vma->vm_start) > SZ_4M)
 		vma->vm_end = vma->vm_start + SZ_4M;
 
-
-#ifdef CONFIG_TIMA_RKP
-	if (vma->vm_end - vma->vm_start) {
-		/* iommu optimization- needs to be turned ON from
-		* the tz side.
-		*/
-		cpu_v7_tima_iommu_opt(vma->vm_start, vma->vm_end, (unsigned long)vma->vm_mm->pgd);
-		__asm__ __volatile__ (
-		"mcr    p15, 0, r0, c8, c3, 0\n"
-		"dsb\n"
-		"isb\n");
-	}
-#endif
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
 		     "binder_mmap: %d %lx-%lx (%ld K) vma %lx pagep %lx\n",
 		     proc->pid, vma->vm_start, vma->vm_end,
